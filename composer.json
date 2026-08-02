@@ -1,0 +1,68 @@
+{
+  "name": "devrkb21/czbd-courier",
+  "description": "Laravel courier fraud and delivery behavior checker for Bangladesh couriers.",
+  "type": "library",
+  "license": "GPL-3.0-only",
+  "keywords": [
+    "fraud detection",
+    "courier bangladesh",
+    "courier checker",
+    "pathao",
+    "steadfast courier",
+    "redx",
+    "paperfly",
+    "carrybee",
+    "fraud prevention",
+    "e-commerce fraud",
+    "order status",
+    "api integration"
+  ],
+  "autoload": {
+    "psr-4": {
+      "Czbd\\CourierChecker\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Czbd\\CourierChecker\\Tests\\": "tests/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Czbd\\CourierChecker\\CourierCheckerServiceProvider"
+      ],
+      "aliases": {
+        "CourierChecker": "Czbd\\CourierChecker\\Facade\\CourierChecker"
+      }
+    }
+  },
+  "authors": [
+    {
+      "name": "Rakib Uddin",
+      "homepage": "https://github.com/devrkb21",
+      "role": "Maintainer"
+    }
+  ],
+  "support": {
+    "issues": "https://github.com/devrkb21/czbd-courier/issues",
+    "source": "https://github.com/devrkb21/czbd-courier",
+    "docs": "https://coderzonebd.com/contact"
+  },
+  "homepage": "https://github.com/devrkb21/czbd-courier",
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "scripts": {
+    "test": "vendor/bin/phpunit"
+  },
+  "require": {
+    "php": "^8.2",
+    "illuminate/support": "^8.0|^9.0|^10.0|^11.0|^12.0|^13.0",
+    "illuminate/http": "^8.0|^9.0|^10.0|^11.0|^12.0|^13.0",
+    "guzzlehttp/guzzle": "^7.8"
+  },
+  "require-dev": {
+    "orchestra/testbench": "^8.0|^9.0|^10.0|^11.0",
+    "phpunit/phpunit": "^10.5|^11.0"
+  }
+}
