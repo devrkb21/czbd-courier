@@ -8,6 +8,8 @@ use Illuminate\Support\Facades\Cache;
 use Czbd\CourierChecker\Contracts\CourierServiceInterface;
 use Czbd\CourierChecker\Helpers\CourierDataValidator;
 use GuzzleHttp\Cookie\CookieJar;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\PromiseInterface;
 
 /**
  * Class CarrybeeService
@@ -71,18 +73,17 @@ readonly class CarrybeeService implements CourierServiceInterface
     }
 
     /**
-     * Retrieve a valid Carrybee access token from the cache or authenticate.
+     * Retrieve a valid Carrybee access token from the cache, or authenticate.
      *
-        * @return array<string, mixed>|null Access token and business id, or null on failure.
+     * @return PromiseInterface<array{accessToken: string, businessId: string}|null>
      */
-    protected function getAccessTokenAndBusinessId(array $account): ?array
+    protected function getAccessTokenAndBusinessIdAsync(array $account): PromiseInterface
     {
         $cacheKey = $this->cacheKeyForPhone($account['phone']);
 
-        // Use cached token if available
         $tokenData = Cache::get($cacheKey);
         if ($tokenData && isset($tokenData['accessToken'], $tokenData['businessId'])) {
-            return $tokenData;
+            return Create::promiseFor($tokenData);
         }
 
         $cookieJar = new CookieJar();
@@ -93,56 +94,184 @@ readonly class CarrybeeService implements CourierServiceInterface
         ];
 
         // Step 1: Get CSRF Token
-        $csrfResponse = $this->httpClient(['cookies' => $cookieJar])
+        return $this->httpClient(['cookies' => $cookieJar])
+            ->async()
             ->withHeaders($headers)
-            ->get('https://merchant.carrybee.com/api/auth/csrf');
+            ->get('https://merchant.carrybee.com/api/auth/csrf')
+            ->then(function ($csrfResponse) use ($account, $cookieJar, $headers, $cacheKey) {
+                if (!$csrfResponse->successful() || !$csrfResponse->json('csrfToken')) {
+                    return null;
+                }
 
-        if (!$csrfResponse->successful() || !$csrfResponse->json('csrfToken')) {
-            return null;
+                $csrfToken = $csrfResponse->json('csrfToken');
+
+                // Step 2: Callback Login
+                // NextAuth expects form data usually or JSON. The screenshot shows Form Data, so we use asForm()
+                return $this->httpClient(['cookies' => $cookieJar])
+                    ->async()
+                    ->withHeaders($headers)
+                    ->asForm()
+                    ->post('https://merchant.carrybee.com/api/auth/callback/login', [
+                        'phone' => '+88' . ltrim($account['phone'], '+88'), // ensure +88 prefix if needed, screenshot shows +8801...
+                        'password' => $account['password'],
+                        'csrfToken' => $csrfToken,
+                        'callbackUrl' => 'https://merchant.carrybee.com/login',
+                    ])
+                    ->then(function ($loginResponse) use ($cookieJar, $headers, $cacheKey) {
+                        if (!$loginResponse->successful()) {
+                            return null;
+                        }
+
+                        // Step 3: Get Session
+                        return $this->httpClient(['cookies' => $cookieJar])
+                            ->async()
+                            ->withHeaders($headers)
+                            ->get('https://merchant.carrybee.com/api/auth/session')
+                            ->then(function ($sessionResponse) use ($cacheKey) {
+                                if (!$sessionResponse->successful() || !$sessionResponse->json('accessToken')) {
+                                    return null;
+                                }
+
+                                $accessToken = $sessionResponse->json('accessToken');
+                                $businessId = $sessionResponse->json('user.selectedBusinessId');
+
+                                if (!$businessId) {
+                                    return null;
+                                }
+
+                                $tokenData = [
+                                    'accessToken' => $accessToken,
+                                    'businessId'  => $businessId,
+                                ];
+
+                                Cache::put($cacheKey, $tokenData, now()->addMinutes(self::CACHE_MINUTES));
+
+                                return $tokenData;
+                            });
+                    });
+            });
+    }
+
+    /**
+     * Execute the Carrybee flow for a single account.
+     */
+    protected function attemptAccountAsync(string $phoneNumber, array $account): PromiseInterface
+    {
+        return $this->getAccessTokenAndBusinessIdAsync($account)->then(function (?array $authData) use ($phoneNumber, $account) {
+            if (!$authData) {
+                return ['error' => 'Login failed or unable to get access token from Carrybee'];
+            }
+
+            $accessToken = $authData['accessToken'];
+            $businessId = $authData['businessId'];
+
+            // Format phone to +8801xxxxxxxxx as expected by the customers endpoint.
+            $localPhone = preg_replace('/^(?:\+?88)?(01[3-9]\d{8})$/', '$1', $phoneNumber);
+
+            if (empty($localPhone) || strlen($localPhone) !== 11) {
+                // Fallback to original if regex failed
+                $localPhone = ltrim($phoneNumber, '+');
+                $localPhone = preg_replace('/^88/', '', $localPhone);
+            }
+
+            $e164Phone = '+88' . $localPhone;
+
+            return $this->httpClient()
+                ->async()
+                ->withHeaders([
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) width/1920 height/1080',
+                    'Accept' => 'application/json',
+                    'Authorization' => 'Bearer ' . $accessToken,
+                ])
+                ->get("https://api-merchant.carrybee.com/api/v2/businesses/{$businessId}/customers/" . rawurlencode($e164Phone))
+                ->then(function ($response) use ($account) {
+                    // A rate-limited/throttled request can still come back as
+                    // HTTP 200 with an unexpected body instead of the real
+                    // payload. Require 'data' to actually be a real array so
+                    // that case is treated as a failed attempt instead of a
+                    // false "0 success / 0 cancel".
+                    if ($response->successful() && !$response->json('error') && is_array($response->json('data'))) {
+                        $data = $response->json('data');
+
+                        $total = (int) ($data['total_order'] ?? 0);
+                        $cancel = (int) ($data['cancelled_order'] ?? 0);
+                        $success = max(0, $total - $cancel);
+                        $success_ratio = (float) ($data['success_rate'] ?? 0);
+
+                        if ($total > 0 && empty($data['success_rate'])) {
+                            $success_ratio = round(($success / $total) * 100, 2);
+                        }
+
+                        return [
+                            'success' => $success,
+                            'cancel' => $cancel,
+                            'total' => $total,
+                            'success_ratio' => $success_ratio,
+                        ];
+                    }
+
+                    if ($response->status() === 401) {
+                        Cache::forget($this->cacheKeyForPhone($account['phone']));
+                        return ['error' => 'Access token expired or invalid for Carrybee. Trying next account.', 'status' => 401];
+                    }
+
+                    return [
+                        'success' => 0,
+                        'cancel' => 0,
+                        'total' => 0,
+                        'success_ratio' => 0,
+                        'error' => 'Failed to fetch from Carrybee',
+                        'status' => $response->status(),
+                    ];
+                });
+        });
+    }
+
+    /**
+     * Try each pooled account in order, stopping at the first clean success.
+     */
+    protected function tryAccountsAsync(string $phoneNumber, int $index, array $lastError): PromiseInterface
+    {
+        if (!isset($this->accounts[$index])) {
+            return Create::promiseFor($lastError);
         }
 
-        $csrfToken = $csrfResponse->json('csrfToken');
+        return $this->attemptAccountAsync($phoneNumber, $this->accounts[$index])
+            ->then(function (array $result) use ($phoneNumber, $index) {
+                if (!isset($result['error'])) {
+                    return $result;
+                }
 
-        // Step 2: Callback Login
-        // NextAuth expects form data usually or JSON. The screenshot shows Form Data, so we use asForm()
-        $loginResponse = $this->httpClient(['cookies' => $cookieJar])
-            ->withHeaders($headers)
-            ->asForm()
-            ->post('https://merchant.carrybee.com/api/auth/callback/login', [
-                'phone' => '+88' . ltrim($account['phone'], '+88'), // ensure +88 prefix if needed, screenshot shows +8801...
-                'password' => $account['password'],
-                'csrfToken' => $csrfToken,
-                'callbackUrl' => 'https://merchant.carrybee.com/login',
+                return $this->tryAccountsAsync($phoneNumber, $index + 1, $result);
+            })
+            ->otherwise(function ($reason) use ($phoneNumber, $index) {
+                return $this->tryAccountsAsync($phoneNumber, $index + 1, [
+                    'error' => 'An error occurred while processing Carrybee request',
+                    'message' => $reason instanceof \Throwable ? $reason->getMessage() : (string) $reason,
+                ]);
+            });
+    }
+
+    /**
+     * Fetch delivery statistics from Carrybee for the given phone number,
+     * without blocking. Lets CourierCheckerManager run every courier
+     * concurrently instead of one after another.
+     *
+     * @param string $phoneNumber The Bangladeshi mobile number to check.
+     * @return PromiseInterface<array>
+     */
+    public function getDeliveryStatsAsync(string $phoneNumber): PromiseInterface
+    {
+        try {
+            CourierDataValidator::checkBdMobile($phoneNumber);
+        } catch (\Exception $e) {
+            return Create::promiseFor([
+                'error' => 'An error occurred while processing Carrybee request',
+                'message' => $e->getMessage(),
             ]);
-
-        if (!$loginResponse->successful()) {
-            return null;
         }
 
-        // Step 3: Get Session
-        $sessionResponse = $this->httpClient(['cookies' => $cookieJar])
-            ->withHeaders($headers)
-            ->get('https://merchant.carrybee.com/api/auth/session');
-
-        if (!$sessionResponse->successful() || !$sessionResponse->json('accessToken')) {
-            return null;
-        }
-
-        $accessToken = $sessionResponse->json('accessToken');
-        $businessId = $sessionResponse->json('user.selectedBusinessId');
-
-        if (!$businessId) {
-            return null;
-        }
-
-        $tokenData = [
-            'accessToken' => $accessToken,
-            'businessId'  => $businessId,
-        ];
-
-        Cache::put($cacheKey, $tokenData, now()->addMinutes(self::CACHE_MINUTES));
-
-        return $tokenData;
+        return $this->tryAccountsAsync($phoneNumber, 0, ['error' => 'Login failed or unable to get access token from Carrybee']);
     }
 
     /**
@@ -154,86 +283,6 @@ readonly class CarrybeeService implements CourierServiceInterface
      */
     public function getDeliveryStats(string $phoneNumber): array
     {
-        try {
-            CourierDataValidator::checkBdMobile($phoneNumber);
-
-            $lastError = ['error' => 'Login failed or unable to get access token from Carrybee'];
-
-            foreach ($this->accounts as $account) {
-                $authData = $this->getAccessTokenAndBusinessId($account);
-
-                if (!$authData) {
-                    $lastError = ['error' => 'Login failed or unable to get access token from Carrybee'];
-                    continue;
-                }
-
-                $accessToken = $authData['accessToken'];
-                $businessId = $authData['businessId'];
-
-                // Format phone to +8801xxxxxxxxx as expected by the customers endpoint.
-                $localPhone = preg_replace('/^(?:\+?88)?(01[3-9]\d{8})$/', '$1', $phoneNumber);
-
-                if (empty($localPhone) || strlen($localPhone) !== 11) {
-                    // Fallback to original if regex failed
-                    $localPhone = ltrim($phoneNumber, '+');
-                    $localPhone = preg_replace('/^88/', '', $localPhone);
-                }
-
-                $e164Phone = '+88' . $localPhone;
-
-                $response = $this->httpClient()->withHeaders([
-                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) width/1920 height/1080',
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $accessToken,
-                ])->get("https://api-merchant.carrybee.com/api/v2/businesses/{$businessId}/customers/" . rawurlencode($e164Phone));
-
-                // A rate-limited/throttled request can still come back as
-                // HTTP 200 with an unexpected body instead of the real
-                // payload. Require 'data' to actually be a real array so
-                // that case is treated as a failed account (and the pool
-                // moves on) instead of a false "0 success / 0 cancel".
-                if ($response->successful() && !$response->json('error') && is_array($response->json('data'))) {
-                    $data = $response->json('data');
-
-                    $total = (int) ($data['total_order'] ?? 0);
-                    $cancel = (int) ($data['cancelled_order'] ?? 0);
-                    $success = max(0, $total - $cancel);
-                    $success_ratio = (float) ($data['success_rate'] ?? 0);
-
-                    if ($total > 0 && empty($data['success_rate'])) {
-                        $success_ratio = round(($success / $total) * 100, 2);
-                    }
-
-                    return [
-                        'success' => $success,
-                        'cancel' => $cancel,
-                        'total' => $total,
-                        'success_ratio' => $success_ratio,
-                    ];
-                }
-
-                if ($response->status() === 401) {
-                    Cache::forget($this->cacheKeyForPhone($account['phone']));
-                    $lastError = ['error' => 'Access token expired or invalid for Carrybee. Trying next account.', 'status' => 401];
-                    continue;
-                }
-
-                $lastError = [
-                    'success' => 0,
-                    'cancel' => 0,
-                    'total' => 0,
-                    'success_ratio' => 0,
-                    'error' => 'Failed to fetch from Carrybee',
-                    'status' => $response->status(),
-                ];
-            }
-
-            return $lastError;
-        } catch (\Exception $e) {
-            return [
-                'error' => 'An error occurred while processing Carrybee request',
-                'message' => $e->getMessage()
-            ];
-        }
+        return $this->getDeliveryStatsAsync($phoneNumber)->wait();
     }
 }

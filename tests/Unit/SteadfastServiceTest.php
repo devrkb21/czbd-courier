@@ -4,12 +4,19 @@ namespace Czbd\CourierChecker\Tests\Unit;
 
 use Czbd\CourierChecker\Tests\TestCase;
 use Czbd\CourierChecker\Services\SteadfastService;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Http;
 use PHPUnit\Framework\Assert;
 
 class SteadfastServiceTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Cache::clear();
+    }
+
     public function test_steadfast_successful_fetch()
     {
         $phone = '01711111111';
@@ -23,13 +30,6 @@ class SteadfastServiceTest extends TestCase
                 'total_delivered' => 5,
                 'total_cancelled' => 2,
             ], 200),
-
-            'https://steadfast.com.bd/user/frauds/check' => Http::response(
-                '<meta name="csrf-token" content="logout_csrf_123">',
-                200
-            ),
-
-            'https://steadfast.com.bd/logout' => Http::response('Logged out', 200),
         ]);
 
         $service = new SteadfastService();
@@ -40,6 +40,68 @@ class SteadfastServiceTest extends TestCase
             'cancel' => 2,
             'total' => 7,
             'success_ratio' => 71.43,
+        ], $result);
+    }
+
+    public function test_steadfast_uses_cached_session_and_skips_login(): void
+    {
+        $phone = '01711111111';
+
+        // TestCase's default steadfast account (see tests/TestCase.php).
+        Cache::put('steadfast_cookies_' . md5('fake_email@test.com'), [
+            'steadfast_courier_session' => 'cached-session-value',
+            'XSRF-TOKEN' => 'cached-xsrf-value',
+        ], now()->addMinutes(50));
+
+        Http::fake([
+            'https://steadfast.com.bd/login' => function () {
+                Assert::fail('Steadfast login should be skipped when a cached session exists.');
+            },
+            "https://steadfast.com.bd/user/consignment/getbyphone/{$phone}" => Http::response([
+                'total_delivered' => 12,
+                'total_cancelled' => 3,
+            ], 200),
+        ]);
+
+        $service = new SteadfastService();
+        $result = $service->getDeliveryStats($phone);
+
+        Assert::assertEquals([
+            'success' => 12,
+            'cancel' => 3,
+            'total' => 15,
+            'success_ratio' => 80.0,
+        ], $result);
+    }
+
+    public function test_steadfast_evicts_stale_cached_session_and_retries_with_fresh_login(): void
+    {
+        $phone = '01711111111';
+
+        Cache::put('steadfast_cookies_' . md5('fake_email@test.com'), [
+            'steadfast_courier_session' => 'stale-session-value',
+        ], now()->addMinutes(50));
+
+        Http::fake([
+            // Cached session is stale: redirected back to the login page
+            // (200 OK, but no total_delivered/total_cancelled keys).
+            "https://steadfast.com.bd/user/consignment/getbyphone/{$phone}" => Http::sequence()
+                ->push('<!DOCTYPE html><title>Steadfast Courier</title>', 200)
+                ->push(['total_delivered' => 4, 'total_cancelled' => 1], 200),
+
+            'https://steadfast.com.bd/login' => Http::sequence()
+                ->push('<input type="hidden" name="_token" value="fake_csrf_123">', 200)
+                ->push('Login Success', 302),
+        ]);
+
+        $service = new SteadfastService();
+        $result = $service->getDeliveryStats($phone);
+
+        Assert::assertEquals([
+            'success' => 4,
+            'cancel' => 1,
+            'total' => 5,
+            'success_ratio' => 80.0,
         ], $result);
     }
 
@@ -65,13 +127,6 @@ class SteadfastServiceTest extends TestCase
             "https://steadfast.com.bd/user/consignment/getbyphone/{$phone}" => Http::sequence()
                 ->push(['message' => 'Too many requests'], 200)
                 ->push(['total_delivered' => 9, 'total_cancelled' => 1], 200),
-
-            'https://steadfast.com.bd/user/frauds/check' => Http::response(
-                '<meta name="csrf-token" content="logout_csrf_123">',
-                200
-            ),
-
-            'https://steadfast.com.bd/logout' => Http::response('Logged out', 200),
         ]);
 
         $service = new SteadfastService();

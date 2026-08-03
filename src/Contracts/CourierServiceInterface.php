@@ -2,6 +2,8 @@
 
 namespace Czbd\CourierChecker\Contracts;
 
+use GuzzleHttp\Promise\PromiseInterface;
+
 /**
  * Interface CourierServiceInterface
  *
@@ -20,4 +22,16 @@ interface CourierServiceInterface
      * @return array Returns an array with keys 'success', 'cancel', 'total', and 'success_ratio'.
      */
     public function getDeliveryStats(string $phoneNumber): array;
+
+    /**
+     * Same as getDeliveryStats(), but returns a promise instead of blocking.
+     *
+     * Lets CourierCheckerManager run every courier concurrently instead of
+     * one after another. The promise always resolves (never rejects) to the
+     * same array shape getDeliveryStats() returns, success or error alike.
+     *
+     * @param string $phoneNumber The customer phone number.
+     * @return PromiseInterface<array>
+     */
+    public function getDeliveryStatsAsync(string $phoneNumber): PromiseInterface;
 }

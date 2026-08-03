@@ -35,6 +35,16 @@ class CourierCheckerManager
     /**
      * Fetch delivery statistics across all configured couriers and aggregate the results.
      *
+     * Couriers are queried one at a time. A concurrent version was tried
+     * (see git history) but Guzzle/Laravel's async promise machinery drives
+     * chained, multi-step requests (login -> fetch, account failover) via a
+     * sequential wait loop under the hood - it only gives real parallelism
+     * for flat, single-step requests, not the kind of session-based flows
+     * every courier here uses. In testing it was no faster on average and
+     * occasionally slower than running sequentially, so it wasn't worth the
+     * added complexity and risk. Each service still caches its own
+     * session/token internally, which is where the real speedup comes from.
+     *
      * @param string $phoneNumber The Bangladeshi mobile number to check.
      * @return array Returns an associative array containing stats for each courier
      *               as well as an overall aggregated summary.

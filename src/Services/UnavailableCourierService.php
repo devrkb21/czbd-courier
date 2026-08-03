@@ -3,6 +3,8 @@
 namespace Czbd\CourierChecker\Services;
 
 use Czbd\CourierChecker\Contracts\CourierServiceInterface;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\PromiseInterface;
 
 /**
  * Class UnavailableCourierService
@@ -23,5 +25,10 @@ readonly class UnavailableCourierService implements CourierServiceInterface
             'error' => sprintf('%s is not configured', $this->courier),
             'message' => $this->reason,
         ];
+    }
+
+    public function getDeliveryStatsAsync(string $phoneNumber): PromiseInterface
+    {
+        return Create::promiseFor($this->getDeliveryStats($phoneNumber));
     }
 }
